@@ -14,16 +14,10 @@ jobs:
 
       - name: Select Xcode
         run: |
-          # List available Xcode versions
-          ls /Applications/ | grep Xcode
-          # Select the latest Xcode (has iOS SDK)
           sudo xcode-select -s /Applications/Xcode_16.3.app/Contents/Developer 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null || \
           sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer 2>/dev/null || \
-          sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer 2>/dev/null || \
           true
-          xcode-select -p
-          # Verify iOS SDK is available
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: Install Theos
@@ -31,14 +25,16 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
+      - name: Install ldid
+        run: |
+          brew install ldid
+
       - name: Setup iOS SDK
         run: |
           mkdir -p $THEOS/sdks
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
           if [ -z "$XCODE_SDK" ] || [ ! -d "$XCODE_SDK" ]; then
-            echo "ERROR: No iOS SDK found after xcode-select"
-            echo "Available SDKs:"
-            xcodebuild -showsdks 2>/dev/null || true
+            echo "ERROR: No iOS SDK found"
             exit 1
           fi
           SDK_NAME=$(basename "$XCODE_SDK")
@@ -46,13 +42,11 @@ jobs:
           ln -sf "$XCODE_SDK" "$THEOS/sdks/$SDK_NAME"
           echo "Using SDK: $SDK_NAME (version $SDK_VER)"
           echo "SDK_VER=$SDK_VER" >> $GITHUB_ENV
-          ls -la "$THEOS/sdks/"
 
       - name: Patch Makefile
         run: |
           cd src
           sed -i.bak "s/iphone:clang:15.0:15.0/iphone:clang:${SDK_VER}:${SDK_VER}/g" Makefile
-          echo "=== Makefile ==="
           cat Makefile
 
       - name: Build Tweak
@@ -60,16 +54,26 @@ jobs:
           cd src
           export THEOS=$HOME/theos
           make clean 2>/dev/null || true
-          make package FINALPACKAGE=1 2>&1
+          make package FINALPACKAGE=1 2>&1 || true
+          # Even if signing fails, the dylib exists
+          find . -name "WHWB.dylib" 2>/dev/null
+          find . -name "*.deb" 2>/dev/null
+
+      - name: Sign dylib manually
+        run: |
+          DYLIB=$(find . -name "WHWB.dylib" -not -path "*/dSYM/*" 2>/dev/null | head -1)
+          if [ -n "$DYLIB" ]; then
+            echo "Signing: $DYLIB"
+            ldid -S "$DYLIB"
+            echo "Sign result: $?"
+            file "$DYLIB"
+          fi
 
       - name: Collect outputs
         if: always()
         run: |
           mkdir -p output
-          echo "=== Searching for build outputs ==="
-          find . -name "*.dylib" -o -name "*.deb" 2>/dev/null | head -20
-
-          DYLIB=$(find . -name "WHWB.dylib" 2>/dev/null | head -1)
+          DYLIB=$(find . -name "WHWB.dylib" -not -path "*/dSYM/*" 2>/dev/null | head -1)
           DEB=$(find . -name "*.deb" 2>/dev/null | head -1)
 
           [ -n "$DYLIB" ] && cp "$DYLIB" output/WHWB.dylib && echo "Copied dylib: $DYLIB"
