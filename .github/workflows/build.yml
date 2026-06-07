@@ -3,13 +3,11 @@ name: Build WHWB Tweak
 on:
   push:
     branches: [main]
-    paths:
-      - 'src/**'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,44 +17,28 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Setup iOS SDK
+      - name: Setup iOS SDK from Xcode
         run: |
           mkdir -p $THEOS/sdks
-          cd /tmp
-          git clone --depth=1 https://github.com/theos/sdks.git theos-sdks
-          # Copy all SDKs to THEOS/sdks
-          cp -r /tmp/theos-sdks/iPhoneOS*.sdk $THEOS/sdks/ 2>/dev/null || true
-          # List what we have
-          echo "Available SDKs:"
-          ls -la $THEOS/sdks/
-
-      - name: Patch Makefile SDK version
-        run: |
-          # Find the actual SDK we have
-          SDK_DIR=$(ls -d $THEOS/sdks/iPhoneOS*.sdk 2>/dev/null | head -1)
-          if [ -z "$SDK_DIR" ]; then
-            # Fallback: use Xcode SDK
-            XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-            if [ -n "$XCODE_SDK" ] && [ -d "$XCODE_SDK" ]; then
-              SDK_NAME=$(basename "$XCODE_SDK")
-              ln -sf "$XCODE_SDK" "$THEOS/sdks/$SDK_NAME"
-              SDK_DIR="$THEOS/sdks/$SDK_NAME"
-              echo "Using Xcode SDK: $SDK_NAME"
-            fi
-          fi
-
-          if [ -n "$SDK_DIR" ]; then
-            SDK_NAME=$(basename "$SDK_DIR")
+          # Use Xcode's built-in iOS SDK
+          XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
+          if [ -n "$XCODE_SDK" ] && [ -d "$XCODE_SDK" ]; then
+            SDK_NAME=$(basename "$XCODE_SDK")
             SDK_VER=$(echo "$SDK_NAME" | sed 's/iPhoneOS//;s/.sdk//')
-            echo "Using SDK version: $SDK_VER"
-            cd src
-            sed -i.bak "s/iphone:clang:15.0:15.0/iphone:clang:${SDK_VER}:${SDK_VER}/g" Makefile
-            echo "Patched Makefile:"
-            cat Makefile
+            ln -sf "$XCODE_SDK" "$THEOS/sdks/$SDK_NAME"
+            echo "Using Xcode SDK: $SDK_NAME (version $SDK_VER)"
+            echo "SDK_VER=$SDK_VER" >> $GITHUB_ENV
           else
-            echo "No SDK found!"
+            echo "ERROR: No iOS SDK found"
             exit 1
           fi
+
+      - name: Patch Makefile
+        run: |
+          cd src
+          sed -i.bak "s/iphone:clang:16.0:16.0/iphone:clang:${SDK_VER}:${SDK_VER}/g" Makefile
+          echo "Patched Makefile:"
+          cat Makefile
 
       - name: Build Tweak
         run: |
@@ -72,7 +54,6 @@ jobs:
         if: always()
         run: |
           mkdir -p output
-          echo "Searching for build outputs..."
           find . -name "*.dylib" -o -name "*.deb" 2>/dev/null | head -20
 
           DYLIB=$(find . -name "WHWB.dylib" 2>/dev/null | head -1)
