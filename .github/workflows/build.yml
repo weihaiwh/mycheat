@@ -1,0 +1,93 @@
+name: Build WHWB Tweak
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      output_format:
+        description: 'Output format'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - dylib-only
+          - deb-only
+          - both
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Install iOS SDK
+        run: |
+          mkdir -p $THEOS/sdks
+          cd $THEOS/sdks
+          git clone https://github.com/theos/sdks.git
+
+      - name: Prepare SDK
+        run: |
+          # Ensure arm64e support
+          cd $THEOS/sdks
+          if [ -d "iPhoneOS15.0.sdk" ]; then
+            echo "SDK found"
+          else
+            echo "Using available SDK"
+            ls -la
+          fi
+
+      - name: Build Tweak
+        run: |
+          cd src
+          export THEOS=$HOME/theos
+          export ARCHS=arm64e
+          export TARGET=iphone:clang:15.0:15.0
+          export THEOS_PACKAGE_SCHEME=rootless
+
+          # Build
+          make clean
+          make package
+
+      - name: Prepare outputs
+        run: |
+          OUTPUT_FORMAT="${{ github.event.inputs.output_format || 'both' }}"
+          mkdir -p output
+
+          cd src
+
+          # Find built dylib
+          DYLIB_PATH=$(find . -name "*.dylib" -o -name "WHWB.dylib" | head -1)
+          if [ -n "$DYLIB_PATH" ]; then
+            if [ "$OUTPUT_FORMAT" = "dylib-only" ] || [ "$OUTPUT_FORMAT" = "both" ]; then
+              cp "$DYLIB_PATH" output/WHWB.dylib
+              echo "Copied dylib: $DYLIB_PATH"
+            fi
+          fi
+
+          # Find built deb
+          DEB_PATH=$(find . -name "*.deb" | head -1)
+          if [ -n "$DEB_PATH" ]; then
+            if [ "$OUTPUT_FORMAT" = "deb-only" ] || [ "$OUTPUT_FORMAT" = "both" ]; then
+              cp "$DEB_PATH" output/WHWB.deb
+              echo "Copied deb: $DEB_PATH"
+            fi
+          fi
+
+          ls -la output/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WHWB-tweak
+          path: output/
+          retention-days: 30

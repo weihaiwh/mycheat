@@ -1,0 +1,9 @@
+Package: com.whwb.helper
+Name: WHWB
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: WHWB Game Helper Tweak
+Maintainer: Developer
+Author: Developer
+Section: Tweaks
+Depends: mobilesubstrate
