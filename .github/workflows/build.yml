@@ -17,50 +17,53 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Setup iOS SDK from Xcode
+      - name: Setup iOS SDK
         run: |
           mkdir -p $THEOS/sdks
-          # Use Xcode's built-in iOS SDK
-          XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
-          if [ -n "$XCODE_SDK" ] && [ -d "$XCODE_SDK" ]; then
-            SDK_NAME=$(basename "$XCODE_SDK")
-            SDK_VER=$(echo "$SDK_NAME" | sed 's/iPhoneOS//;s/.sdk//')
-            ln -sf "$XCODE_SDK" "$THEOS/sdks/$SDK_NAME"
-            echo "Using Xcode SDK: $SDK_NAME (version $SDK_VER)"
-            echo "SDK_VER=$SDK_VER" >> $GITHUB_ENV
-          else
-            echo "ERROR: No iOS SDK found"
+          # Download iOS SDK from community repo
+          git clone --depth=1 https://github.com/xybpkg/iOS-SDKs.git /tmp/ios-sdks
+          # Find the latest iPhoneOS SDK
+          SDK_PATH=$(find /tmp/ios-sdks -name "iPhoneOS*.sdk" -type d | sort -V | tail -1)
+          if [ -z "$SDK_PATH" ]; then
+            echo "ERROR: No iPhoneOS SDK found in download"
+            find /tmp/ios-sdks -maxdepth 3 -type d | head -30
             exit 1
           fi
+          SDK_NAME=$(basename "$SDK_PATH")
+          SDK_VER=$(echo "$SDK_NAME" | sed 's/iPhoneOS//;s/.sdk//')
+          cp -R "$SDK_PATH" "$THEOS/sdks/$SDK_NAME"
+          echo "Using SDK: $SDK_NAME (version $SDK_VER)"
+          echo "SDK_VER=$SDK_VER" >> $GITHUB_ENV
+          ls -la "$THEOS/sdks/"
 
       - name: Patch Makefile
         run: |
           cd src
-          sed -i.bak "s/iphone:clang:16.0:16.0/iphone:clang:${SDK_VER}:${SDK_VER}/g" Makefile
-          echo "Patched Makefile:"
+          # Patch SDK version in Makefile
+          sed -i.bak "s/iphone:clang:15.0:15.0/iphone:clang:${SDK_VER}:${SDK_VER}/g" Makefile
+          echo "=== Makefile ==="
           cat Makefile
 
       - name: Build Tweak
         run: |
           cd src
           export THEOS=$HOME/theos
-          export ARCHS=arm64e
-          export THEOS_PACKAGE_SCHEME=rootless
-
           make clean 2>/dev/null || true
-          make package 2>&1
+          make package FINALPACKAGE=1 2>&1
 
       - name: Collect outputs
         if: always()
         run: |
           mkdir -p output
+          echo "=== Searching for build outputs ==="
+          find $HOME/theos -name "*.dylib" -o -name "*.deb" 2>/dev/null | head -20
           find . -name "*.dylib" -o -name "*.deb" 2>/dev/null | head -20
 
           DYLIB=$(find . -name "WHWB.dylib" 2>/dev/null | head -1)
           DEB=$(find . -name "*.deb" 2>/dev/null | head -1)
 
-          [ -n "$DYLIB" ] && cp "$DYLIB" output/WHWB.dylib && echo "Copied dylib"
-          [ -n "$DEB" ] && cp "$DEB" output/WHWB.deb && echo "Copied deb"
+          [ -n "$DYLIB" ] && cp "$DYLIB" output/WHWB.dylib && echo "Copied dylib: $DYLIB"
+          [ -n "$DEB" ] && cp "$DEB" output/WHWB.deb && echo "Copied deb: $DEB"
 
           ls -la output/
 

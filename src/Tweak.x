@@ -39,7 +39,7 @@ static bool hook_CheckSkillIsReady(void *frame, int stateType, void *characterFi
     if (g_patchSkillReady) {
         return true;
     }
-    return orig_CheckSkillIsReady(frame, stateType, void *characterField, void *states);
+    return orig_CheckSkillIsReady(frame, stateType, characterField, states);
 }
 
 #pragma mark - 获取基址
