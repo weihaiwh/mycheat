@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = WHWB
 
-WHWB_FILES = Tweak.x
+WHWB_FILES = Tweak.xmm
 WHWB_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-error
 WHWB_FRAMEWORKS = UIKit Foundation CoreGraphics
 
