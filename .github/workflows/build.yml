@@ -29,21 +29,50 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $HOME/theos
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Install iOS SDK
+      - name: Setup iOS SDK
         run: |
+          # Download Xcode and extract SDK
+          # Use theos sdks
           mkdir -p $THEOS/sdks
           cd $THEOS/sdks
-          git clone https://github.com/theos/sdks.git
+          git clone https://github.com/theos/sdks.git theos-sdks
+          # Move SDKs to correct location
+          if [ -d "theos-sdks/iPhoneOS15.0.sdk" ]; then
+            mv theos-sdks/iPhoneOS15.0.sdk ./
+          fi
+          # Also check for newer SDKs
+          for sdk in theos-sdks/iPhoneOS*.sdk; do
+            if [ -d "$sdk" ]; then
+              sdk_name=$(basename "$sdk")
+              if [ ! -d "$sdk_name" ]; then
+                mv "$sdk" ./
+              fi
+              echo "Found SDK: $sdk_name"
+            fi
+          done
+          ls -la ./
+          # List available SDKs from Xcode as fallback
+          xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true
 
-      - name: Prepare SDK
+      - name: Patch Makefile for available SDK
         run: |
-          # Ensure arm64e support
-          cd $THEOS/sdks
-          if [ -d "iPhoneOS15.0.sdk" ]; then
-            echo "SDK found"
+          # Find what SDK is available
+          if [ -d "$THEOS/sdks/iPhoneOS15.0.sdk" ]; then
+            echo "iPhoneOS15.0.sdk available"
           else
-            echo "Using available SDK"
-            ls -la
+            # Try to use Xcode's SDK
+            XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || echo "")
+            if [ -n "$XCODE_SDK" ] && [ -d "$XCODE_SDK" ]; then
+              SDK_NAME=$(basename "$XCODE_SDK")
+              ln -s "$XCODE_SDK" "$THEOS/sdks/$SDK_NAME"
+              echo "Linked Xcode SDK: $SDK_NAME"
+              # Update Makefile TARGET to use available SDK version
+              SDK_VER=$(echo "$SDK_NAME" | sed 's/iPhoneOS//;s/.sdk//')
+              echo "SDK version: $SDK_VER"
+              cd src
+              sed -i.bak "s/iphone:clang:15.0:15.0/iphone:clang:${SDK_VER}:${SDK_VER}/g" Makefile
+              cat Makefile
+            fi
           fi
 
       - name: Build Tweak
@@ -51,41 +80,46 @@ jobs:
           cd src
           export THEOS=$HOME/theos
           export ARCHS=arm64e
-          export TARGET=iphone:clang:15.0:15.0
           export THEOS_PACKAGE_SCHEME=rootless
 
           # Build
-          make clean
-          make package
+          make clean 2>/dev/null || true
+          make package THEOS_MAKE_PATH=$THEOS/makefiles 2>&1 || {
+            echo "=== Build failed, trying debug ==="
+            make package THEOS_MAKE_PATH=$THEOS/makefiles DEBUG=1 2>&1
+          }
 
       - name: Prepare outputs
+        if: always()
         run: |
           OUTPUT_FORMAT="${{ github.event.inputs.output_format || 'both' }}"
           mkdir -p output
 
-          cd src
+          # Find built files
+          echo "Searching for build outputs..."
+          find . -name "*.dylib" -o -name "*.deb" | head -20
 
-          # Find built dylib
-          DYLIB_PATH=$(find . -name "*.dylib" -o -name "WHWB.dylib" | head -1)
+          DYLIB_PATH=$(find . -name "WHWB.dylib" -o -name "*.dylib" | head -1)
+          DEB_PATH=$(find . -name "*.deb" | head -1)
+
           if [ -n "$DYLIB_PATH" ]; then
             if [ "$OUTPUT_FORMAT" = "dylib-only" ] || [ "$OUTPUT_FORMAT" = "both" ]; then
               cp "$DYLIB_PATH" output/WHWB.dylib
-              echo "Copied dylib: $DYLIB_PATH"
+              echo "Copied dylib"
             fi
           fi
 
-          # Find built deb
-          DEB_PATH=$(find . -name "*.deb" | head -1)
           if [ -n "$DEB_PATH" ]; then
             if [ "$OUTPUT_FORMAT" = "deb-only" ] || [ "$OUTPUT_FORMAT" = "both" ]; then
               cp "$DEB_PATH" output/WHWB.deb
-              echo "Copied deb: $DEB_PATH"
+              echo "Copied deb"
             fi
           fi
 
-          ls -la output/
+          ls -la output/ 2>/dev/null || echo "No output files"
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: WHWB-tweak
