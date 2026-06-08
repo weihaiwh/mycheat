@@ -2,20 +2,22 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
-#include <substrate.h>
+#include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 
 // ============================================================
-//  WHWB Tweak v6.1 - iOS IL2CPP Game Hack
+//  WHWB Tweak v7.0 - 无 CydiaSubstrate 依赖版本
 //  Target: com.jyjh.whwb v1.10.1 (FrameSync based game)
 //  Platform: iOS arm64e, Dopamine rootless
 //
-//  v6.1 vs v6.0:
-//  + 文件日志: 所有 NSLog 同时写入 /var/mobile/Documents/whwb.log
-//  + 诊断信息: 构造函数执行、dylib 加载、通知触发、UI 创建、hooks 安装
-//  + 更强健的 UI 创建: 多种 fallback 方案
+//  v7.0 核心变更:
+//  - 不链接 CydiaSubstrate! 用 dlsym 运行时加载 MSHookFunction
+//  - 添加 mprotect+inline patch 作为 fallback
+//  - 这样 dylib 可以被 Substrate 和 TrollFools 两种方式注入
+//  - 保留文件日志 + 悬浮窗 UI
 // ============================================================
 
-#pragma mark - 文件日志 (关键! 写到手机上方便排查)
+#pragma mark - 文件日志
 
 static NSString *LOG_PATH = @"/var/mobile/Documents/whwb.log";
 
@@ -26,10 +28,8 @@ static void fileLog(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
     va_end(args);
 
-    // 同时 NSLog (系统日志)
     NSLog(@"[WHWB] %@", msg);
 
-    // 写入文件 (追加模式)
     NSDate *now = [NSDate date];
     NSDateFormatter *df = [[NSDateFormatter alloc] init];
     df.dateFormat = @"HH:mm:ss.SSS";
@@ -42,9 +42,7 @@ static void fileLog(NSString *fmt, ...) {
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     } else {
-        // 文件不存在，创建
         [line writeToFile:LOG_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        // 设置权限让 mobile 用户可读写
         [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0666)}
                                          ofItemAtPath:LOG_PATH
                                                 error:nil];
@@ -63,7 +61,114 @@ static BOOL g_patchLimitDamage = NO;
 static BOOL g_hooksInstalled = NO;
 static int32_t TARGET_LIMIT_DAMAGE = 131072000;
 
-#pragma mark - Hook 函数声明
+#pragma mark - 运行时加载 MSHookFunction (不链接 CydiaSubstrate!)
+
+typedef void (*MSHookFunction_t)(void *symbol, void *replace, void **result);
+static MSHookFunction_t MSHookFunction_ptr = NULL;
+
+static void loadSubstrateRuntime() {
+    // 尝试多种路径加载 CydiaSubstrate/ElleKit
+    NSArray *paths = @[
+        @"/var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+        @"/usr/lib/libsubstrate.dylib",
+        @"/var/jb/usr/lib/libsubstrate.dylib",
+        @"/var/jb/usr/lib/libellekit.dylib"
+    ];
+
+    for (NSString *path in paths) {
+        void *handle = dlopen([path UTF8String], RTLD_LAZY | RTLD_NOLOAD);
+        if (handle) {
+            fileLog(@"Substrate already loaded: %@", path);
+            MSHookFunction_ptr = (MSHookFunction_t)dlsym(handle, "MSHookFunction");
+            if (MSHookFunction_ptr) {
+                fileLog(@"MSHookFunction found via dlsym: %p", MSHookFunction_ptr);
+                return;
+            }
+        }
+    }
+
+    // 如果还没加载, 尝试主动加载
+    for (NSString *path in paths) {
+        void *handle = dlopen([path UTF8String], RTLD_LAZY);
+        if (handle) {
+            MSHookFunction_ptr = (MSHookFunction_t)dlsym(handle, "MSHookFunction");
+            if (MSHookFunction_ptr) {
+                fileLog(@"MSHookFunction loaded from: %@", path);
+                return;
+            }
+        }
+    }
+
+    fileLog(@"WARNING: MSHookFunction NOT found, will use inline patching");
+}
+
+#pragma mark - Inline ARM64 Memory Patching (fallback)
+
+// 保存原始字节用于恢复
+static uint32_t g_origBytes_Attack[2] = {0};
+static uint32_t g_origBytes_Ready[2] = {0};
+static uint32_t g_origBytes_LimitDmg[2] = {0};
+static void *g_patchAddr_Attack = NULL;
+static void *g_patchAddr_Ready = NULL;
+static void *g_patchAddr_LimitDmg = NULL;
+
+static BOOL patchMemory(void *addr, const void *patch, size_t patchSize) {
+    if (!addr) return NO;
+
+    uintptr_t page = (uintptr_t)addr & ~(getpagesize() - 1);
+    size_t offset = (uintptr_t)addr - page;
+    size_t len = (offset + patchSize + getpagesize() - 1) & ~(getpagesize() - 1);
+
+    // 修改内存保护为 RWX
+    if (mprotect((void *)page, len, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        fileLog(@"mprotect RWX FAILED for %p: %s", addr, strerror(errno));
+        // 尝试 vm_protect 作为 fallback
+        // Dopamine 越狱应该允许 mprotect
+        return NO;
+    }
+
+    // 写入补丁
+    memcpy(addr, patch, patchSize);
+
+    // 刷新指令缓存
+    sys_icache_invalidate(addr, patchSize);
+
+    // 恢复为只读+可执行
+    mprotect((void *)page, len, PROT_READ | PROT_EXEC);
+
+    return YES;
+}
+
+// ARM64: MOV W0, #imm16; RET
+// MOV W0, #imm16 = 0x52800000 | (imm16 << 5)
+// RET on ARM64e = RETAA = 0xD65F0FFF (兼容 ARM64 和 ARM64e)
+static uint32_t makeMovW0(uint16_t imm16) {
+    return 0x52800000 | ((uint32_t)imm16 << 5);
+}
+
+// 生成 "return true" 补丁: MOV W0, #1; RETAA
+static void makePatchReturnTrue(uint32_t *out) {
+    out[0] = makeMovW0(1);  // MOV W0, #1
+    out[1] = 0xD65F0FFF;    // RETAA (ARM64e PAC 兼容)
+}
+
+// 生成 "return TARGET_LIMIT_DAMAGE" 补丁
+// 注意: TARGET_LIMIT_DAMAGE = 131072000 = 0x7D00000
+// 这个值超过 16 位, 需要多条指令
+// MOVZ W0, #0; MOVK W0, #0x7D0, LSL #16; RETAA
+// 等等... 但实际上 get_limitDamage 返回 Int32
+// 131072000 = 0x07D00000
+// 用 MOVZ + MOVK:
+//   MOVZ W0, #0x0000          = 0x52800000
+//   MOVK W0, #0x07D0, LSL #16 = 0x72A00FA0
+//   RETAA                      = 0xD65F0FFF
+static void makePatchReturnLimitDamage(uint32_t *out) {
+    out[0] = 0x52800000;    // MOVZ W0, #0
+    out[1] = 0x72A00FA0;    // MOVK W0, #0x07D0, LSL #16
+    out[2] = 0xD65F0FFF;    // RETAA
+}
+
+#pragma mark - Hook 函数 (用于 MSHookFunction 方式)
 
 static bool (*orig_CheckSkillAttackCanUse)(void *frame, int stateType, void *characterField, void *states);
 static bool (*orig_CheckSkillIsReady)(void *frame, int stateType, void *characterField, void *states);
@@ -91,14 +196,15 @@ static uintptr_t getGameAssemblyBase() {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "GameAssembly")) {
             uintptr_t base = (uintptr_t)_dyld_get_image_header(i);
-            fileLog(@"GameAssembly found: %s base=0x%lx (image #%u)", name, (unsigned long)base, i);
             return base;
         }
     }
     return 0;
 }
 
-#pragma mark - 安装 Hooks
+#pragma mark - 安装 Hooks (两种方式)
+
+static BOOL g_useInlinePatch = NO;
 
 static void installHooks() {
     if (g_hooksInstalled) return;
@@ -108,7 +214,7 @@ static void installHooks() {
         fileLog(@"GameAssembly not loaded yet");
         return;
     }
-    fileLog(@"GameAssembly base: 0x%lx, installing hooks...", (unsigned long)base);
+    fileLog(@"GameAssembly base: 0x%lx", (unsigned long)base);
 
     void *addrAttack  = (void *)(base + OFFSET_CHECK_SKILL_ATTACK);
     void *addrReady   = (void *)(base + OFFSET_CHECK_SKILL_READY);
@@ -116,15 +222,65 @@ static void installHooks() {
 
     fileLog(@"Hook addresses: Attack=%p Ready=%p LimitDmg=%p", addrAttack, addrReady, addrLimitDmg);
 
-    MSHookFunction(addrAttack,  (void *)hook_CheckSkillAttackCanUse, (void **)&orig_CheckSkillAttackCanUse);
-    MSHookFunction(addrReady,   (void *)hook_CheckSkillIsReady,      (void **)&orig_CheckSkillIsReady);
-    MSHookFunction(addrLimitDmg,(void *)hook_get_limitDamage,        (void **)&orig_get_limitDamage);
+    // 尝试 MSHookFunction 方式
+    if (MSHookFunction_ptr) {
+        fileLog(@"Using MSHookFunction method...");
+        MSHookFunction_ptr(addrAttack,  (void *)hook_CheckSkillAttackCanUse, (void **)&orig_CheckSkillAttackCanUse);
+        MSHookFunction_ptr(addrReady,   (void *)hook_CheckSkillIsReady,      (void **)&orig_CheckSkillIsReady);
+        MSHookFunction_ptr(addrLimitDmg,(void *)hook_get_limitDamage,        (void **)&orig_get_limitDamage);
+        fileLog(@"MSHookFunction hooks installed OK!");
+    } else {
+        // Inline patching fallback
+        fileLog(@"Using inline memory patching method...");
+        g_useInlinePatch = YES;
+
+        // 保存原始字节
+        memcpy(g_origBytes_Attack, addrAttack, sizeof(g_origBytes_Attack));
+        memcpy(g_origBytes_Ready, addrReady, sizeof(g_origBytes_Ready));
+        memcpy(g_origBytes_LimitDmg, addrLimitDmg, sizeof(g_origBytes_LimitDmg));
+        g_patchAddr_Attack = addrAttack;
+        g_patchAddr_Ready = addrReady;
+        g_patchAddr_LimitDmg = addrLimitDmg;
+
+        // 应用补丁: 所有功能默认开启
+        uint32_t patchTrue[2];
+        makePatchReturnTrue(patchTrue);
+        uint32_t patchLimitDmg[3];
+        makePatchReturnLimitDamage(patchLimitDmg);
+
+        BOOL r1 = patchMemory(addrAttack, patchTrue, sizeof(patchTrue));
+        BOOL r2 = patchMemory(addrReady, patchTrue, sizeof(patchTrue));
+        BOOL r3 = patchMemory(addrLimitDmg, patchLimitDmg, sizeof(patchLimitDmg));
+
+        fileLog(@"Inline patch results: Attack=%d Ready=%d LimitDmg=%d", r1, r2, r3);
+    }
 
     g_hooksInstalled = YES;
     g_patchSkillAttack = YES;
     g_patchSkillReady  = YES;
     g_patchLimitDamage = YES;
-    fileLog(@"All 3 hooks installed OK!");
+    fileLog(@"All hooks installed! Method: %s", MSHookFunction_ptr ? "MSHookFunction" : "InlinePatch");
+}
+
+// Toggle inline patches on/off
+static void applyInlinePatch(BOOL enable, void *addr, uint32_t *origBytes, size_t origSize) {
+    if (!addr) return;
+    if (enable) {
+        // 需要重新应用补丁
+        // 根据 addr 决定用哪个补丁
+        if (addr == g_patchAddr_Attack || addr == g_patchAddr_Ready) {
+            uint32_t patchTrue[2];
+            makePatchReturnTrue(patchTrue);
+            patchMemory(addr, patchTrue, sizeof(patchTrue));
+        } else if (addr == g_patchAddr_LimitDmg) {
+            uint32_t patchLimitDmg[3];
+            makePatchReturnLimitDamage(patchLimitDmg);
+            patchMemory(addr, patchLimitDmg, sizeof(patchLimitDmg));
+        }
+    } else {
+        // 恢复原始字节
+        patchMemory(addr, origBytes, origSize);
+    }
 }
 
 #pragma mark - 触摸穿透 Window
@@ -174,7 +330,7 @@ static void installHooks() {
     self.clipsToBounds = NO;
     self.panelVisible = NO;
 
-    // ---- 浮动按钮 (小圆点) ----
+    // ---- 浮动按钮 ----
     self.toggleButton = [UIButton buttonWithType:UIButtonTypeCustom];
     self.toggleButton.frame = CGRectMake(0, 0, 36, 36);
     self.toggleButton.backgroundColor = [[UIColor colorWithRed:0.15 green:0.45 blue:1.0 alpha:1.0] colorWithAlphaComponent:0.85];
@@ -191,7 +347,7 @@ static void installHooks() {
     [self.toggleButton addGestureRecognizer:pan];
     [self addSubview:self.toggleButton];
 
-    // ---- 面板 (默认隐藏) ----
+    // ---- 面板 ----
     self.panelView = [[UIView alloc] initWithFrame:CGRectMake(0, 42, 250, 280)];
     self.panelView.backgroundColor = [UIColor colorWithRed:0.06 green:0.06 blue:0.12 alpha:0.95];
     self.panelView.layer.cornerRadius = 12;
@@ -209,7 +365,7 @@ static void installHooks() {
     CGFloat y = 10, x = 10, w = 230;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(x, y, w, 22)];
-    title.text = @"WHWB Helper v6.1";
+    title.text = @"WHWB Helper v7.0";
     title.textColor = [UIColor colorWithRed:0.35 green:0.7 blue:1.0 alpha:1.0];
     title.font = [UIFont boldSystemFontOfSize:16];
     title.textAlignment = NSTextAlignmentCenter;
@@ -217,7 +373,7 @@ static void installHooks() {
     y += 26;
 
     UILabel *ver = [[UILabel alloc] initWithFrame:CGRectMake(x, y, w, 13)];
-    ver.text = @"GameAssembly.dylib hook";
+    ver.text = @"No-Substrate Edition";
     ver.textColor = [UIColor colorWithWhite:0.35 alpha:1.0];
     ver.font = [UIFont systemFontOfSize:10];
     ver.textAlignment = NSTextAlignmentCenter;
@@ -293,9 +449,29 @@ static void installHooks() {
     [g setTranslation:CGPointZero inView:self.superview];
 }
 
-- (void)toggleAttack:(UISwitch *)s   { g_patchSkillAttack  = s.isOn; [self refreshStatus]; }
-- (void)toggleReady:(UISwitch *)s    { g_patchSkillReady   = s.isOn; [self refreshStatus]; }
-- (void)toggleLimitDmg:(UISwitch *)s { g_patchLimitDamage  = s.isOn; [self refreshStatus]; }
+- (void)toggleAttack:(UISwitch *)s {
+    g_patchSkillAttack = s.isOn;
+    if (g_useInlinePatch) {
+        applyInlinePatch(s.isOn, g_patchAddr_Attack, g_origBytes_Attack, sizeof(g_origBytes_Attack));
+    }
+    [self refreshStatus];
+}
+
+- (void)toggleReady:(UISwitch *)s {
+    g_patchSkillReady = s.isOn;
+    if (g_useInlinePatch) {
+        applyInlinePatch(s.isOn, g_patchAddr_Ready, g_origBytes_Ready, sizeof(g_origBytes_Ready));
+    }
+    [self refreshStatus];
+}
+
+- (void)toggleLimitDmg:(UISwitch *)s {
+    g_patchLimitDamage = s.isOn;
+    if (g_useInlinePatch) {
+        applyInlinePatch(s.isOn, g_patchAddr_LimitDmg, g_origBytes_LimitDmg, sizeof(g_origBytes_LimitDmg));
+    }
+    [self refreshStatus];
+}
 
 - (void)refreshStatus {
     if (!g_hooksInstalled) {
@@ -307,11 +483,12 @@ static void installHooks() {
     if (g_patchSkillAttack)  [a addObject:@"Atk"];
     if (g_patchSkillReady)   [a addObject:@"Ready"];
     if (g_patchLimitDamage)  [a addObject:@"Dmg"];
+    NSString *method = g_useInlinePatch ? @"[Inline]" : @"[Substrate]";
     if (a.count) {
-        self.statusLabel.text = [NSString stringWithFormat:@"Active: %@", [a componentsJoinedByString:@", "]];
+        self.statusLabel.text = [NSString stringWithFormat:@"%@ Active: %@", method, [a componentsJoinedByString:@", "]];
         self.statusLabel.textColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.3 alpha:1.0];
     } else {
-        self.statusLabel.text = @"All OFF";
+        self.statusLabel.text = [NSString stringWithFormat:@"%@ All OFF", method];
         self.statusLabel.textColor = [UIColor colorWithWhite:0.5 alpha:1.0];
     }
 }
@@ -331,53 +508,36 @@ static WHWBPassthroughWindow *g_overlayWindow = nil;
 static WHWBMenuView *g_menuView = nil;
 static int g_hookRetryCount = 0;
 
-#pragma mark - 诊断: 列出所有 loaded images
+#pragma mark - 诊断
 
 static void dumpLoadedImages() {
     fileLog(@"=== Loaded images (%u) ===", _dyld_image_count());
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && (strstr(name, "GameAssembly") || strstr(name, "WHWB") || strstr(name, "whwb") || strstr(name, "jyjh"))) {
+        if (name && (strstr(name, "GameAssembly") || strstr(name, "WHWB") || strstr(name, "whwb") || strstr(name, "jyjh") || strstr(name, "Substrate") || strstr(name, "ellekit") || strstr(name, "TweakLoader"))) {
             fileLog(@"  [%u] %s base=0x%lx", i, name, (unsigned long)_dyld_get_image_header(i));
         }
     }
-    fileLog(@"=== End images ===");
 }
-
-#pragma mark - 诊断: 检查 UIApplication 状态
 
 static void dumpAppState() {
     UIApplication *app = [UIApplication sharedApplication];
-    fileLog(@"AppState: app=%p", app);
-    if (app) {
-        fileLog(@"  applicationState=%ld", (long)app.applicationState);
-        fileLog(@"  connectedScenes count=%lu", (unsigned long)app.connectedScenes.count);
-        if (@available(iOS 13.0, *)) {
-            for (UIWindowScene *scene in app.connectedScenes) {
-                fileLog(@"  scene: %@ state=%ld windows=%lu",
-                        scene.title ?: @"(nil)",
-                        (long)scene.activationState,
-                        (unsigned long)scene.windows.count);
-                for (UIWindow *w in scene.windows) {
-                    fileLog(@"    window: %p level=%.0f frame=%@ hidden=%d",
-                            w, w.windowLevel, NSStringFromCGRect(w.frame), w.hidden);
-                }
-            }
-        }
-        fileLog(@"  keyWindow=%p", app.keyWindow);
-        fileLog(@"  windows count=%lu", (unsigned long)app.windows.count);
-        for (UIWindow *w in app.windows) {
-            fileLog(@"    window: %p level=%.0f frame=%@ hidden=%d",
-                    w, w.windowLevel, NSStringFromCGRect(w.frame), w.hidden);
+    fileLog(@"AppState: app=%p state=%ld", app, (long)app.applicationState);
+    if (@available(iOS 13.0, *)) {
+        for (UIWindowScene *scene in app.connectedScenes) {
+            fileLog(@"  scene: state=%ld windows=%lu",
+                    (long)scene.activationState,
+                    (unsigned long)scene.windows.count);
         }
     }
+    fileLog(@"  windows=%lu keyWindow=%p", (unsigned long)app.windows.count, app.keyWindow);
 }
 
-#pragma mark - 创建悬浮窗 (多种 fallback)
+#pragma mark - 创建悬浮窗
 
 static void showMenu() {
     if (g_menuView) {
-        fileLog(@"showMenu: menu already exists, skip");
+        fileLog(@"showMenu: already exists");
         return;
     }
 
@@ -385,10 +545,8 @@ static void showMenu() {
 
     UIWindow *overlayWindow = nil;
 
-    // 方案A: iOS 13+ 用 UIWindowScene
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            fileLog(@"  trying scene: state=%ld", (long)scene.activationState);
             if (scene.activationState == UISceneActivationStateForegroundActive ||
                 scene.activationState == UISceneActivationStateForegroundInactive) {
                 overlayWindow = [[WHWBPassthroughWindow alloc] initWithWindowScene:scene];
@@ -398,14 +556,13 @@ static void showMenu() {
         }
     }
 
-    // 方案B: 直接 initWithFrame (不依赖 scene)
     if (!overlayWindow) {
         overlayWindow = [[WHWBPassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
         fileLog(@"  created window WITHOUT scene (fallback): %p", overlayWindow);
     }
 
     if (!overlayWindow) {
-        fileLog(@"FATAL: could not create any window!");
+        fileLog(@"FATAL: could not create window!");
         return;
     }
 
@@ -414,20 +571,16 @@ static void showMenu() {
     overlayWindow.windowLevel = UIWindowLevelNormal + 200;
     overlayWindow.clipsToBounds = NO;
 
-    // rootViewController
     UIViewController *vc = [[UIViewController alloc] init];
     WHWBPassthroughView *containerView = [[WHWBPassthroughView alloc] initWithFrame:overlayWindow.bounds];
     containerView.backgroundColor = [UIColor clearColor];
     containerView.userInteractionEnabled = YES;
     vc.view = containerView;
 
-    // 菜单
     g_menuView = [[WHWBMenuView alloc] initWithFrame:CGRectMake(10, 150, 260, 340)];
     [containerView addSubview:g_menuView];
 
     overlayWindow.rootViewController = vc;
-
-    // 关键: 不用 makeKeyAndVisible (不抢焦点), 直接设 hidden=NO
     overlayWindow.hidden = NO;
 
     g_overlayWindow = (WHWBPassthroughWindow *)overlayWindow;
@@ -436,20 +589,10 @@ static void showMenu() {
         [g_menuView onHooksInstalled];
     }
 
-    fileLog(@"Overlay window created OK! level=%.0f frame=%@ windowPtr=%p menuPtr=%p",
-          overlayWindow.windowLevel,
-          NSStringFromCGRect(overlayWindow.frame),
-          overlayWindow, g_menuView);
-
-    // 诊断: 验证 window 是否在 app.windows 里
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        fileLog(@"=== Post-create diagnostics ===");
-        dumpAppState();
-    });
+    fileLog(@"Overlay window created! level=%.0f ptr=%p", overlayWindow.windowLevel, overlayWindow);
 }
 
-#pragma mark - 轮询等待 GameAssembly + 安装 hooks
+#pragma mark - 轮询安装 Hooks
 
 static void tryInstallHooks();
 
@@ -457,7 +600,7 @@ static void tryInstallHooks() {
     if (g_hooksInstalled) return;
 
     g_hookRetryCount++;
-    fileLog(@"tryInstallHooks attempt #%d, images=%u", g_hookRetryCount, _dyld_image_count());
+    fileLog(@"tryInstallHooks #%d, images=%u", g_hookRetryCount, _dyld_image_count());
 
     uintptr_t base = getGameAssemblyBase();
     if (base == 0) {
@@ -467,7 +610,7 @@ static void tryInstallHooks() {
                 tryInstallHooks();
             });
         } else {
-            fileLog(@"ERROR: GameAssembly not found after 30s, giving up");
+            fileLog(@"ERROR: GameAssembly not found after 30s");
             dumpLoadedImages();
             if (g_menuView) {
                 g_menuView.statusLabel.text = @"FAILED: GameAssembly not found";
@@ -482,7 +625,7 @@ static void tryInstallHooks() {
     } @catch (NSException *e) {
         fileLog(@"EXCEPTION in installHooks: %@", e);
         if (g_menuView) {
-            g_menuView.statusLabel.text = [NSString stringWithFormat:@"Hook error: %@", e.reason];
+            g_menuView.statusLabel.text = [NSString stringWithFormat:@"Error: %@", e.reason];
             g_menuView.statusLabel.textColor = [UIColor redColor];
         }
         return;
@@ -498,9 +641,11 @@ static void tryInstallHooks() {
 static void delayedInit() {
     fileLog(@"=== delayedInit START ===");
 
-    // 诊断
     dumpAppState();
     dumpLoadedImages();
+
+    // 加载 Substrate 运行时 (dlsym 方式)
+    loadSubstrateRuntime();
 
     @try {
         showMenu();
@@ -517,30 +662,28 @@ static void delayedInit() {
 
 __attribute__((constructor))
 static void whwb_init() {
-    // 清空旧日志 (每次启动重新记录)
-    [@"=== WHWB v6.1 Log Start ===\n" writeToFile:LOG_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // 清空旧日志
+    [@"=== WHWB v7.0 Log Start ===\n" writeToFile:LOG_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @(0666)}
                                      ofItemAtPath:LOG_PATH
                                             error:nil];
 
     fileLog(@"====================================");
-    fileLog(@"WHWB Helper v6.1 constructor loaded");
-    fileLog(@"Target: com.jyjh.whwb v1.10.1");
+    fileLog(@"WHWB Helper v7.0 constructor loaded");
+    fileLog(@"No-Substrate Edition!");
     fileLog(@"PID: %d", getpid());
     fileLog(@"====================================");
 
-    // 列出已加载的 images (constructor 时可能还没有 GameAssembly)
+    // 列出关键 images
     fileLog(@"Images at constructor time: %u", _dyld_image_count());
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && (strstr(name, "GameAssembly") || strstr(name, "WHWB") || strstr(name, "jyjh"))) {
+        if (name && (strstr(name, "GameAssembly") || strstr(name, "WHWB") || strstr(name, "jyjh") || strstr(name, "Substrate") || strstr(name, "ellekit") || strstr(name, "TweakLoader"))) {
             fileLog(@"  [%u] %s", i, name);
         }
     }
 
-    // 关键: constructor 里只注册通知
-    // 等 UIApplicationDidBecomeActiveNotification 再初始化 UI
-
+    // 注册通知, 等 app 激活后初始化 UI
     __block id activeObserver = nil;
     activeObserver = [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
@@ -549,7 +692,7 @@ static void whwb_init() {
                 usingBlock:^(NSNotification *note) {
         [[NSNotificationCenter defaultCenter] removeObserver:activeObserver];
         activeObserver = nil;
-        fileLog(@"App became active notification received!");
+        fileLog(@"App became active notification!");
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -557,22 +700,18 @@ static void whwb_init() {
         });
     }];
 
-    fileLog(@"Registered UIApplicationDidBecomeActiveNotification observer: %p", activeObserver);
-
-    // Fallback: 5秒后如果通知还没触发
+    // 5秒 fallback
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!g_menuView) {
-            fileLog(@"Fallback: 5s timeout, notification never fired!");
+            fileLog(@"Fallback: 5s timeout!");
             if (activeObserver) {
                 [[NSNotificationCenter defaultCenter] removeObserver:activeObserver];
                 activeObserver = nil;
             }
             delayedInit();
-        } else {
-            fileLog(@"Fallback: menu already created, skip");
         }
     });
 
-    fileLog(@"Constructor done, waiting for app activation...");
+    fileLog(@"Constructor done, waiting for activation...");
 }
